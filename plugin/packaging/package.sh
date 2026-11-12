@@ -56,6 +56,10 @@ fetch_firecracker() {
     rm -rf "$work"
 }
 
+# Absolute, because the zip step runs from inside the staging directory.
+mkdir -p "$out"
+out="$(cd "$out" && pwd)"
+
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/compute" "$out"
