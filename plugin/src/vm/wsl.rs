@@ -283,7 +283,7 @@ mod tests {
     fn windows_paths_map_to_the_wsl_drive_mounts() {
         assert_eq!(
             wsl_path(Path::new(
-                r"C:\Users\me\.mesh-llm\sandbox\images\base\x86_64\kernel"
+                r"C:\Users\me\.mesh-llm\compute\images\base\x86_64\kernel"
             ))
             .unwrap(),
             "/mnt/c/Users/me/.mesh-llm/compute/images/base/x86_64/kernel"
