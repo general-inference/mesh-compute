@@ -33,6 +33,7 @@ curl -s localhost:3131/api/plugins/compute/tools/sandbox_exec \
 
 ## Requirements
 
+- mesh-llm 0.79 or newer.
 - **Linux**: access to `/dev/kvm` (add yourself to the `kvm` group).
 - **macOS**: Apple Silicon.
 - **Windows**: WSL2 (`wsl --install`) on x86_64.
