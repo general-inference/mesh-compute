@@ -1,0 +1,52 @@
+[package]
+name = "mesh-compute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mesh LLM plugin that runs isolated microVM sandboxes across a private mesh"
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "mesh-compute"
+path = "src/main.rs"
+
+[features]
+default = ["image-download"]
+# Fetch published guest images on first use. Off in the Linux build that runs
+# inside WSL, which never downloads.
+image-download = ["dep:reqwest", "dep:sha2", "dep:hex", "dep:tar", "dep:flate2"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+flate2 = { version = "1", optional = true }
+hex = { version = "0.4", optional = true }
+mesh-compute-guest = { path = "../guest", default-features = false, features = ["tokio"] }
+mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm", rev = "52fcc94df0ecaecdfeff07ab2ff61aa3f26005f0" }
+# rustls with bundled web roots: no system CA bundle and no C TLS library.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = { version = "0.10", optional = true }
+tar = { version = "0.4", optional = true }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-virtualization = { version = "0.3", features = ["block2", "dispatch2"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

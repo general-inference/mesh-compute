@@ -1,0 +1,18 @@
+[workspace]
+members = ["plugin", "guest"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/general-inference/mesh-compute"
+
+[workspace.lints.clippy]
+cognitive_complexity = "warn"
+too_many_lines = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

@@ -1,0 +1,334 @@
+name: Release
+
+# Push a `v*` tag to build and publish:
+#
+#   compute-image-base-<tag>-{x86_64,aarch64}.tar.gz   guest images
+#   compute-<tag>-<target>.{tar.gz,zip}                plugin archives
+#   compute-<target>.{tar.gz,zip}                      the same, stable-named
+#
+# The guest images are built first; their sha256s are compiled into the
+# plugin, which downloads them from this release on first use and refuses
+# anything else. Before publishing, the Linux x86_64 archive is installed on
+# a KVM runner and boots sandboxes from the images, fetched and verified
+# through the same download path users take.
+#
+# Dispatching the workflow rehearses all of it on the chosen branch, named
+# after the version you give, and publishes nothing.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to name the rehearsal after, matching plugin.toml, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  TAG: ${{ github.event.inputs.version || github.ref_name }}
+  IMAGE_NAME: base
+
+jobs:
+  version:
+    name: Check the version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Version, Cargo.toml and plugin.toml agree
+        run: |
+          set -euo pipefail
+          plugin="$(sed -n 's/^version = "\(.*\)"$/\1/p' plugin.toml)"
+          cargo="$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          if [ "v$plugin" != "$TAG" ] || [ "v$cargo" != "$TAG" ]; then
+            echo "::error::tag $TAG, plugin.toml $plugin and Cargo.toml $cargo must agree" >&2
+            exit 1
+          fi
+
+  images:
+    name: Guest image ${{ matrix.arch }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      # Kernel builds dominate the image build; reuse one built from the
+      # same version and configuration.
+      - name: Cache kernel
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/images/${{ env.IMAGE_NAME }}/${{ matrix.arch }}/kernel
+            ${{ runner.temp }}/images/${{ env.IMAGE_NAME }}/${{ matrix.arch }}/image.json
+          key: kernel-${{ matrix.arch }}-${{ hashFiles('guest/image/kernel.config', 'guest/image/build-kernel.sh', 'guest/image/builder.Dockerfile') }}
+
+      - name: Build the guest image
+        run: guest/image/build.sh "$RUNNER_TEMP/images"
+
+      - name: Archive it and record its pin
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pin"
+          digest="$(guest/image/archive.sh "$RUNNER_TEMP/images" "$IMAGE_NAME" "$TAG" "$RUNNER_TEMP/release")"
+          printf '%s/%s=%s\n' "$IMAGE_NAME" "$ARCH" "$digest" > "$RUNNER_TEMP/pin/$ARCH"
+
+      - name: Upload image
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/release/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload pin
+        uses: actions/upload-artifact@v4
+        with:
+          name: pin-${{ matrix.arch }}
+          path: ${{ runner.temp }}/pin/${{ matrix.arch }}
+          if-no-files-found: error
+
+  pins:
+    name: Image pins
+    needs: images
+    runs-on: ubuntu-latest
+    outputs:
+      pins: ${{ steps.pins.outputs.pins }}
+    steps:
+      - name: Download pins
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pin-*
+          path: pins
+          merge-multiple: true
+      - id: pins
+        run: |
+          set -euo pipefail
+          pins="$(cat pins/* | paste -sd, -)"
+          if ! [[ "$pins" =~ ^([a-z0-9_.-]+/[a-z0-9_]+=[0-9a-f]{64},?)+$ ]]; then
+            echo "::error::unexpected image pins: $pins" >&2
+            exit 1
+          fi
+          echo "pins=$pins" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: pins
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+          # The Linux build the Windows x86_64 archive runs inside WSL:
+          # static, so any distribution's libc will do, and without downloads.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            features: --no-default-features
+    env:
+      MESH_COMPUTE_IMAGE_PINS: ${{ needs.pins.outputs.pins }}
+      MESH_COMPUTE_RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install Rust
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-${{ matrix.target }}-
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086 # FEATURES is a flag list or empty
+          cargo build --release --locked -p mesh-compute --target "$TARGET" $FEATURES
+          mkdir -p "$RUNNER_TEMP/bin"
+          binary="target/$TARGET/release/mesh-compute"
+          [[ "$TARGET" == *windows* ]] && binary="$binary.exe"
+          cp "$binary" "$RUNNER_TEMP/bin/"
+
+      - name: Sign with the virtualization entitlement
+        if: runner.os == 'macOS'
+        run: plugin/packaging/sign-macos.sh "$RUNNER_TEMP/bin/mesh-compute"
+
+      - name: Check the binary runs and write its package manifest
+        if: matrix.target != 'x86_64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          binary="$(ls "$RUNNER_TEMP"/bin/mesh-compute*)"
+          "$binary" --version
+          "$binary" --print-package-manifest > "$RUNNER_TEMP/bin/plugin-manifest.json"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: ${{ runner.temp }}/bin/*
+          if-no-files-found: error
+
+  package:
+    name: Package
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: bins
+
+      - name: Package every target
+        run: |
+          set -euo pipefail
+          package=plugin/packaging/package.sh
+          manifest=bins/bin-x86_64-unknown-linux-gnu/plugin-manifest.json
+          # Every build describes the same plugin; refuse to ship if not.
+          for other in bins/*/plugin-manifest.json; do
+            cmp -s "$manifest" "$other" || { echo "::error::$other differs from $manifest" >&2; exit 1; }
+          done
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+            "$package" --target "$target" --tag "$TAG" --manifest "$manifest" \
+              --binary "bins/bin-$target/mesh-compute" --out release
+          done
+          "$package" --target x86_64-pc-windows-msvc --tag "$TAG" --manifest "$manifest" \
+            --binary bins/bin-x86_64-pc-windows-msvc/mesh-compute.exe \
+            --linux-binary bins/bin-x86_64-unknown-linux-musl/mesh-compute --out release
+          # Windows on ARM has no WSL2 nested virtualization: it ships without
+          # a local backend and creates sandboxes on other nodes.
+          "$package" --target aarch64-pc-windows-msvc --tag "$TAG" --manifest "$manifest" \
+            --binary bins/bin-aarch64-pc-windows-msvc/mesh-compute.exe --out release
+          # Stable-named copies for "latest" installs.
+          for archive in release/compute-"$TAG"-*; do
+            cp "$archive" "release/compute-${archive#release/compute-"$TAG"-}"
+          done
+          ls -l release
+
+      - name: Upload archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: archives
+          path: release/*
+          if-no-files-found: error
+
+  smoke:
+    name: Smoke test (Linux x86_64, KVM)
+    needs: [images, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Let the runner user open /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          name: archives
+          path: release
+
+      - name: Download the x86_64 image
+        uses: actions/download-artifact@v4
+        with:
+          name: image-x86_64
+          path: mirror/${{ env.TAG }}
+
+      - name: Install the plugin and boot sandboxes from the published images
+        run: |
+          set -euo pipefail
+          tar -xzf "release/compute-$TAG-x86_64-unknown-linux-gnu.tar.gz"
+          # Serve the image the way the release will, so the check downloads
+          # it and verifies the pin compiled into the plugin.
+          docker run -d --rm --name mirror -p 127.0.0.1:8080:80 \
+            -v "$PWD/mirror:/usr/share/nginx/html:ro" nginx:1.27-alpine
+          for _ in $(seq 30); do curl -s -o /dev/null http://127.0.0.1:8080/ && break; sleep 1; done
+          settings="{\"state_dir\":\"$RUNNER_TEMP/compute\",\"image_url\":\"http://127.0.0.1:8080\"}"
+          MESH_COMPUTE_SETTINGS="$settings" compute/compute check
+          MESH_COMPUTE_SETTINGS="$settings" compute/compute check --bridge
+
+  publish:
+    name: Publish GitHub release
+    needs: [images, package, smoke]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download images
+        uses: actions/download-artifact@v4
+        with:
+          pattern: image-*
+          path: assets
+          merge-multiple: true
+
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          name: archives
+          path: assets
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" assets/* --title "$TAG" --generate-notes --verify-tag \
+            --repo "$GITHUB_REPOSITORY"

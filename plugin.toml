@@ -1,0 +1,4 @@
+name = "compute"
+version = "0.1.0"
+description = "MicroVM sandboxes for running code across a private Mesh LLM mesh"
+command = "compute"
